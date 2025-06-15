@@ -6,7 +6,7 @@ This Snowflake Snowpark Python script is designed to **search for, log, and mask
 
 ---
 
-## 🚀 Features
+## Features
 - Searches for a given email address across all tables (excluding views) in specified databases and schemas.
 - Dynamically builds and logs full SQL queries to locate matching records.
 - Identifies "customer-related" and "PII-related" columns using intelligent pattern matching.
