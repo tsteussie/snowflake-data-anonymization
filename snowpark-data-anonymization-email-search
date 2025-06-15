@@ -1,0 +1,265 @@
+import snowflake.snowpark as snowpark
+from snowflake.snowpark.functions import *
+from snowflake.snowpark.types import *
+from datetime import datetime
+import re
+
+# Specify customer email
+email_submitted = "tsteussie@gmail.com"
+
+# Specify criteria used in the search - database(s) and schema
+databases = ["DEV_COPY", "PRD_COPY", "PRD_LAKE"]
+schema = "PUBLIC"
+
+# Specifiy sql statement
+sql_template = f"""
+SELECT
+    'SELECT ' || COLUMN_NAME ||
+    ' FROM ' || TABLE_SCHEMA || '.' || TABLE_NAME ||
+    ' WHERE ' || COLUMN_NAME || ' IN (''{email_submitted}'');' AS query,
+    TABLE_NAME,
+    TABLE_SCHEMA,
+    COLUMN_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME IN (
+    SELECT a.table_name
+    FROM INFORMATION_SCHEMA.TABLES a
+    WHERE a.table_type = 'BASE TABLE'
+      AND a.table_name IN (
+        SELECT TABLE_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS b
+        WHERE b.COLUMN_NAME ILIKE '%email%'
+      )
+)
+AND COLUMN_NAME ILIKE '%email%'
+AND DATA_TYPE IN ('TEXT', 'VARCHAR')
+"""
+
+# Specify Snowflake connection parameters
+connection_parameters = {
+    "role": "SYSADMIN",
+    "warehouse": "DNA_WH",
+}
+
+# CREATE SNOWPARK SESSION/FUNCTION
+def main(session: snowpark.Session):
+
+    combined_results = []
+
+    for db in databases:
+        session.use_database(db)
+        session.use_schema(schema)
+
+        result_df = session.sql(sql_template)
+        queries = result_df.collect()
+
+        for row in queries:
+            query = row["QUERY"]
+            table_name = row["TABLE_NAME"]
+            table_schema = row["TABLE_SCHEMA"]
+            column_name = row["COLUMN_NAME"]
+
+            select_all_query = f"SELECT * FROM {db}.{table_schema}.{table_name} WHERE {column_name} IN ('{email_submitted}');"
+
+            print("🔍 Executing search query:", query)
+            print("📄 Full object name:", f"{db}.{table_schema}.{table_name}")
+
+            try:
+                customer_df = session.sql(f"""
+                    SELECT COLUMN_NAME
+                    FROM {db}.INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_NAME = '{table_name}'
+                        AND TABLE_TYPE = 'BASE TABLE'
+                        AND COLUMN_NAME ILIKE ANY ('%NAME_CNSE%', '%CNSE_NAME%', 
+                        '%NAME_CNSR%', '%CNSR_NAME%',
+                        '%NAME_BILL%', '%BILL_TO_NAME%',  '%ATTN_BILL_TO%',
+                        '%CUST_LAST%', '%CUST_FIRST%', 
+                        '%NAME_LAST%', '%NAME_LST%', '%LAST_NAME%', '%LST_NAME%', 
+                        '%NAME_FIRST%', '%NAME_FRST%', '%FIRST_NAME%', '%FRST_NAME%',
+                        '%NAME_SECONDARY%', 
+                        '%SHPR_NAME%', '%NAME_SHPR%', 
+                        '%SHPR_LAST%', '%SHPR_LST%', 
+                        '%SHPR_FIRST%', '%SHPR_FRST%'
+                        '%NAME_CONT%', 
+                        '%NAME_CMPY_ORG%', '%NAME_CMPY_DEST%',
+                        '%NAME_NTFY%', '%AUTH_ANSR%')
+                """)
+                customer_columns = ", ".join(dict.fromkeys([r["COLUMN_NAME"] for r in customer_df.collect()]))
+
+            except Exception as e:
+                customer_columns = f"<error: {str(e)}>"
+
+            try:
+                related_df = session.sql(f"""
+                    SELECT COLUMN_NAME
+                    FROM {db}.INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_NAME = '{table_name}'
+                        AND TABLE_TYPE = 'BASE TABLE'
+                        AND COLUMN_NAME ILIKE ANY ('%EMAIL%', 
+                        '%ADDR_%', '%_ADDR%',  '%ADDR1%',  '%ADDR2%', 
+                        '%STREET%', '%STRE_ORG%', '%STRE_DEST%', 
+                        '%_PO_%', '%POBOX%', 
+                        '%_CITY%', '%CITY_%', 
+                        '%APT_ORG%', '%APT_DEST%', '%ORG_APT%', '%DEST_APT%',
+                        '%FLR_ORG%', '%FLR_DEST%', '%ORG_FLR%', '%DEST_FLR%',
+                        '%CODE_ZIP%', '%ZIP_CODE%', '%POSTAL_CODE%',
+                        '%PHONE%', '%PHON_%', '%CONTACT_NUMBER%', '%_FAX_%',
+                        '%TITL_SHPR%', '%SHPR_TITL%', '%CUST_TITLE%', '%INIT_SHPR%', '%SHPR_INIT%', '%CUST_MIDDLE%')
+                """)
+                related_columns = ", ".join(dict.fromkeys([r["COLUMN_NAME"] for r in related_df.collect()]))
+
+            except Exception as e:
+                related_columns = f"<error: {str(e)}>"
+
+            try:
+                result = session.sql(query).collect()
+                for r in result:
+                    combined_results.append((query, str(r), db, schema, select_all_query, customer_columns, related_columns))
+                if not result:
+                    combined_results.append((query, "<no match>", db, schema, select_all_query, customer_columns, related_columns))
+
+            except Exception as e:
+                combined_results.append((query, f"<error: {str(e)}>", db, schema, select_all_query, customer_columns, related_columns))
+
+    result_schema = StructType([
+        StructField("query", StringType()),
+        StructField("result", StringType()),
+        StructField("database", StringType()),
+        StructField("schema", StringType()),
+        StructField("select_all_query", StringType()),
+        StructField("customer_columns", StringType()),
+        StructField("related_columns", StringType())
+    ])
+
+    combined_results = [r if len(r) == 7 else r + ("",) * (7 - len(r)) for r in combined_results]
+
+    result_df = session.create_dataframe(combined_results, schema=result_schema)
+
+    result_df = result_df.filter(
+        (col("result").is_not_null()) &
+        (col("result") != lit("<no match>")) &
+        (trim(left(col("result"), 7)) != lit("<error:"))
+    )
+
+    result_df = result_df.drop('result','query')
+
+    result_df = result_df.with_column("email_address", lit(email_submitted))
+    result_df = result_df.with_column("search_datetime", current_timestamp())
+
+    result_df = result_df.drop_duplicates('select_all_query')
+
+    result_df.write.mode("append").save_as_table("prd_mart.data_anonymization.search_records_log")
+
+    latest_time = session.table("prd_mart.data_anonymization.search_records_log").agg(max("search_datetime").alias("latest_time")).collect()[0]["LATEST_TIME"]
+
+    log_df = session.table("prd_mart.data_anonymization.search_records_log").filter(col("search_datetime") == lit(latest_time)) \
+        .select("database", "schema", "select_all_query", "customer_columns", "related_columns")
+
+    for row in log_df.collect():
+        db = row["DATABASE"]
+        select_query = row["SELECT_ALL_QUERY"]
+        customer_cols = row["CUSTOMER_COLUMNS"]
+        related_cols = row["RELATED_COLUMNS"]
+
+        print("🔄 Preparing update for:", select_query)
+
+        if not customer_cols or customer_cols.startswith("<error"):
+            continue
+
+        update_sets = []
+
+        for col_name in [c.strip() for c in customer_cols.split(",") if c.strip()]:
+            update_sets.append(f"{col_name} = 'Removed'")
+
+        for col_name in [c.strip() for c in related_cols.split(",") if c.strip()]:
+            update_sets.append(f"{col_name} = ''")
+
+        if not update_sets:
+            continue
+
+        match = re.match(r"SELECT \* FROM (.+?) WHERE (.+);", select_query)
+        if not match:
+            continue
+
+        full_table = match.group(1)
+        where_clause = match.group(2)
+
+        # GRANT UPDATE BEFORE RUNNING
+        grant_sql = f"GRANT UPDATE ON {full_table} TO ROLE SYSADMIN"
+        try:
+            session.sql(grant_sql).collect()
+        except Exception as e:
+            print(f"⚠️ Failed to grant update on {full_table}: {e}")
+
+        update_sql = f"""
+            UPDATE {full_table}
+            SET {', '.join(update_sets)}
+            WHERE {where_clause};
+        """
+
+        print("🛠 Executing update SQL:", update_sql)
+
+        try:
+            update_result = session.sql(update_sql).collect()
+            rows_updated = update_result[0]['rows_updated'] if update_result and 'rows_updated' in update_result[0] else "unknown"
+            print(f"✅ Updated {full_table} — Rows affected: {rows_updated}")
+        except Exception as e:
+            print(f"❌ Error updating {full_table}: {e}")
+
+    session.sql("""
+    CREATE TABLE IF NOT EXISTS PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS (
+        CUSTOMER_EMAIL STRING,
+        UPDATE_DATETIME TIMESTAMP_NTZ,
+        DATABASES_UPDATED INT,
+        TABLES_UPDATED INT,
+        COLUMNS_UPDATED INT
+    )
+    """).collect()
+
+    databases_updated = set()
+    tables_updated = set()
+    columns_updated = 0
+
+    for row in result_df.collect():
+        db = row["DATABASE"]
+        query = row["SELECT_ALL_QUERY"]
+        customer_cols = row["CUSTOMER_COLUMNS"]
+        related_cols = row["RELATED_COLUMNS"]
+
+        databases_updated.add(db)
+
+        match = re.match(r"SELECT \* FROM\s+([^.]+\.[^.]+\.[^.]+)\s+WHERE", query)
+        if match:
+            full_table = match.group(1)
+            tables_updated.add(full_table)
+
+        customer_list = [c.strip() for c in customer_cols.split(",") if c.strip()]
+        related_list = [c.strip() for c in related_cols.split(",") if c.strip()]
+        columns_updated += len(customer_list) + len(related_list)
+
+    summary_data = [
+        (
+            email_submitted,
+            datetime.now(),
+            len(databases_updated),
+            len(tables_updated),
+            columns_updated
+        )
+    ]
+
+    summary_schema = StructType([
+    StructField("CUSTOMER_EMAIL", StringType()),
+    StructField("UPDATE_DATETIME", TimestampType()),
+    StructField("DATABASES_UPDATED", IntegerType()),
+    StructField("TABLES_UPDATED", IntegerType()),
+    StructField("COLUMNS_UPDATED", IntegerType())
+    ])
+
+    summary_df = session.create_dataframe(summary_data, schema=summary_schema)
+    summary_df.write.mode("append").save_as_table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
+
+    result_df.show()
+
+    df_read_back = session.table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
+
+    return df_read_back
