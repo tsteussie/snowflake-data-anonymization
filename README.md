@@ -1,4 +1,4 @@
-# ❄️ Snowpark Email Search and Data Masking
+# ❄️ Snowflake Email Search and Data Masking Using Snowpark
 This Snowflake Snowpark Python script is designed to **search for, log, and mask sensitive email-related information** across multiple databases in a Snowflake environment. It identifies records related to a specific email address and updates personally identifiable information (PII) to anonymize the data.
 
 ---
