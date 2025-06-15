@@ -10,7 +10,7 @@ import re
 email_submitted = "exapmle@gmail.com"
 
 # Databases and schema to search
-databases = ["DEV_COPY", "PRD_COPY", "PRD_LAKE"]
+databases = ["DEV_COPY", "PRD_COPY"]
 schema = "PUBLIC"
 
 # SQL template to identify email-related columns
