@@ -4,13 +4,13 @@ from snowflake.snowpark.types import *
 from datetime import datetime
 import re
 
-# -------- Specify customer email and function parameters  -------- #
+# -------- Specify user inputs -------- #
 
 # Email address to search for
-email_submitted = "exapmle@gmail.com"
+email_submitted = "toddsteussie@gmail.com"
 
 # Databases and schema to search
-databases = ["DEV_COPY", "PRD_COPY"]
+databases = ["DEV_COPY", "PRD_COPY", "PRD_LAKE"]
 schema = "PUBLIC"
 
 # SQL template to identify email-related columns
@@ -66,60 +66,35 @@ def main(session: snowpark.Session):
             print("🔍 Executing search query:", query)
             print("📄 Full object name:", f"{db}.{table_schema}.{table_name}")
 
-            # -------- Get customer-related columns -------- #
             try:
                 customer_df = session.sql(f"""
                     SELECT COLUMN_NAME
                     FROM {db}.INFORMATION_SCHEMA.COLUMNS
                     WHERE TABLE_NAME = '{table_name}'
-                        AND COLUMN_NAME ILIKE ANY ('%NAME_CNSE%', '%CNSE_NAME%', 
-                        '%NAME_CNSR%', '%CNSR_NAME%',
-                        '%NAME_BILL%', '%BILL_TO_NAME%',  '%ATTN_BILL_TO%',
-                        '%CUST_LAST%', '%CUST_FIRST%', 
-                        '%NAME_LAST%', '%NAME_LST%', '%LAST_NAME%', '%LST_NAME%', 
-                        '%NAME_FIRST%', '%NAME_FRST%', '%FIRST_NAME%', '%FRST_NAME%',
-                        '%NAME_SECONDARY%', 
-                        '%SHPR_NAME%', '%NAME_SHPR%', 
-                        '%SHPR_LAST%', '%SHPR_LST%', 
-                        '%SHPR_FIRST%', '%SHPR_FRST%',
-                        '%NAME_CONT%', 
-                        '%NAME_CMPY_ORG%', '%NAME_CMPY_DEST%',
-                        '%NAME_NTFY%', '%AUTH_ANSR%')
+                        AND COLUMN_NAME ILIKE ANY (...)
                 """)
                 customer_list = list(dict.fromkeys([r["COLUMN_NAME"] for r in customer_df.collect()]))
             except Exception as e:
                 customer_list = [f"<error: {str(e)}>"]
 
-            # -------- Get address/contact-related columns -------- #
             try:
                 related_df = session.sql(f"""
                     SELECT COLUMN_NAME
                     FROM {db}.INFORMATION_SCHEMA.COLUMNS
                     WHERE TABLE_NAME = '{table_name}'
-                        AND COLUMN_NAME ILIKE ANY ('%EMAIL%', 
-                        '%ADDR_%', '%_ADDR%',  '%ADDR1%',  '%ADDR2%', 
-                        '%STREET%', '%STRE_ORG%', '%STRE_DEST%', 
-                        '%_PO_%', '%POBOX%', 
-                        '%_CITY%', '%CITY_%', 
-                        '%APT_ORG%', '%APT_DEST%', '%ORG_APT%', '%DEST_APT%',
-                        '%FLR_ORG%', '%FLR_DEST%', '%ORG_FLR%', '%DEST_FLR%',
-                        '%CODE_ZIP%', '%ZIP_CODE%', '%POSTAL_CODE%',
-                        '%PHONE%', '%PHON_%', '%CONTACT_NUMBER%', '%_FAX_%',
-                        '%TITL_SHPR%', '%SHPR_TITL%', '%CUST_TITLE%', '%INIT_SHPR%', '%SHPR_INIT%', '%CUST_MIDDLE%')
+                        AND COLUMN_NAME ILIKE ANY (...)
                 """)
                 related_list = list(dict.fromkeys([r["COLUMN_NAME"] for r in related_df.collect()]))
             except Exception as e:
                 related_list = [f"<error: {str(e)}>"]
 
-            # -------- Remove duplicate columns -------- #
             customer_set = set(customer_list)
             related_set = set(related_list)
-            all_columns = list(dict.fromkeys(customer_list + related_list))  # Deduplicated list
+            all_columns = list(dict.fromkeys(customer_list + related_list))
 
             customer_columns = ", ".join(customer_set)
             related_columns = ", ".join(related_set)
 
-            # -------- Run main query and collect results -------- #
             try:
                 result = session.sql(query).collect()
                 for r in result:
@@ -129,7 +104,6 @@ def main(session: snowpark.Session):
             except Exception as e:
                 combined_results.append((query, f"<error: {str(e)}>", db, schema, select_all_query, customer_columns, related_columns))
 
-    # -------- Create final DataFrame schema -------- #
     result_schema = StructType([
         StructField("query", StringType()),
         StructField("result", StringType()),
@@ -143,29 +117,33 @@ def main(session: snowpark.Session):
     combined_results = [r if len(r) == 7 else r + ("",) * (7 - len(r)) for r in combined_results]
     result_df = session.create_dataframe(combined_results, schema=result_schema)
 
-    # -------- Filter out errors and no matches -------- #
     result_df = result_df.filter(
         (col("result").is_not_null()) &
         (col("result") != lit("<no match>")) &
         (trim(left(col("result"), 7)) != lit("<error:"))
     )
 
-    # -------- Prepare logging output -------- #
+    if result_df.count() == 0:
+        print("⚠️ No matching records found. Skipping update and log write.")
+        return None
+
     result_df = result_df.drop('result', 'query') \
         .with_column("email_address", lit(email_submitted)) \
         .with_column("search_datetime", current_timestamp()) \
         .drop_duplicates('select_all_query')
 
-    # -------- Write search record results -------- #
     result_df.write.mode("append").save_as_table("prd_mart.data_anonymization.search_records_log")
 
-    # -------- Identify most recent search for updates -------- #
     latest_time = session.table("prd_mart.data_anonymization.search_records_log").agg(max("search_datetime").alias("latest_time")).collect()[0]["LATEST_TIME"]
 
-    log_df = session.table("prd_mart.data_anonymization.search_records_log").filter(col("search_datetime") == lit(latest_time)) \
+    log_df = session.table("prd_mart.data_anonymization.search_records_log")\
+        .filter(col("search_datetime") == lit(latest_time))\
         .select("database", "schema", "select_all_query", "customer_columns", "related_columns")
 
-    # -------- Construct UPDATE statements and run -------- #
+    if log_df.count() == 0:
+        print("⚠️ No update log entries found — skipping update process.")
+        return None
+
     for row in log_df.collect():
         db = row["DATABASE"]
         select_query = row["SELECT_ALL_QUERY"]
@@ -177,7 +155,6 @@ def main(session: snowpark.Session):
         customer_set = set(c.strip() for c in customer_cols.split(",") if c.strip())
         related_set = set(c.strip() for c in related_cols.split(",") if c.strip())
 
-        # Assign values: prioritize 'Removed' for customer fields
         column_update_map = {col: "'Removed'" for col in customer_set}
         for col in related_set - customer_set:
             column_update_map[col] = "''"
@@ -193,7 +170,6 @@ def main(session: snowpark.Session):
         full_table = match.group(1)
         where_clause = match.group(2)
 
-        # Grant update before modifying table
         try:
             session.sql(f"GRANT UPDATE ON {full_table} TO ROLE SYSADMIN").collect()
         except Exception as e:
@@ -209,7 +185,10 @@ def main(session: snowpark.Session):
         except Exception as e:
             print(f"❌ Error updating {full_table}: {e}")
 
-    # -------- Log completed request summary -------- #
+    if result_df.count() == 0:
+        print("⚠️ No updates occurred, skipping summary logging.")
+        return None
+
     session.sql("""
     CREATE TABLE IF NOT EXISTS PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS (
         CUSTOMER_EMAIL STRING,
@@ -257,10 +236,5 @@ def main(session: snowpark.Session):
     summary_df = session.create_dataframe(summary_data, schema=summary_schema)
     summary_df.write.mode("append").save_as_table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
 
-    # -------- Optional: return summary -------- #
+    print("✅ Script completed. Review logs for details.")
     return session.table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
-
-
-    df_read_back = session.table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
-
-    return df_read_back
