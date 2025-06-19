@@ -4,16 +4,20 @@ from snowflake.snowpark.types import *
 from datetime import datetime
 import re
 
-# -------- Specify user inputs -------- #
+####################################
+# 1. SETUP VARIABLES AND CONNECTIONS
+####################################
 
-# Email address to search for
-email_submitted = "toddsteussie@gmail.com"
+# Email address to search for and anonymize
+email_submitted = "example@gmail.com"
 
-# Databases and schema to search
+# List of Snowflake databases to search
 databases = ["DEV_COPY", "PRD_COPY", "PRD_LAKE"]
+
+# Schema to use within each database
 schema = "PUBLIC"
 
-# SQL template to identify email-related columns
+# SQL template to find matching email columns in tables
 sql_template = f"""
 SELECT
     'SELECT ' || COLUMN_NAME ||
@@ -43,15 +47,62 @@ connection_parameters = {
     "warehouse": "DNA_WH",
 }
 
-# -------- Execute Main Function -------- #
+####################################
+# 2. DEFINE COLUMN PATTERNS TO MATCH
+####################################
+
+# Columns that may contain customer names
+customer_patterns = [
+    '%NAME_CNSE%', '%CNSE_NAME%', '%NAME_CNSR%', '%CNSR_NAME%',
+    '%NAME_BILL%', '%BILL_TO_NAME%', '%ATTN_BILL_TO%',
+    '%CUST_LAST%', '%CUST_FIRST%',
+    '%NAME_LAST%', '%NAME_LST%', '%LAST_NAME%', '%LST_NAME%',
+    '%NAME_FIRST%', '%NAME_FRST%', '%FIRST_NAME%', '%FRST_NAME%',
+    '%SHPR_NAME%', '%NAME_SHPR%', '%SHPR_LAST%', 
+    '%SHPR_LST%', '%SHPR_FIRST%', '%SHPR_FRST%', '%INIT_SHPR%', '%NAME_CONT%',
+    '%NAME_CMPY_ORG%', '%NAME_CMPY_DEST%', '%NAME_NTFY%', '%AUTH_ANSR%'
+]
+
+# Related data fields to anonymize (e.g., address, phone, etc.)
+related_patterns = [
+    '%EMAIL%', '%ADDR_%', '%_ADDR%', '%ADDR1%', '%ADDR2%',
+    '%STREET%', '%STRE_ORG%', '%STRE_DEST%', '%_PO_%', '%POBOX%',
+    '%_CITY%', '%CITY_%', 
+    '%APT_ORG%', '%APT_DEST%', '%ORG_APT%', '%DEST_APT%', '%FLR_ORG%', '%FLR_DEST%', '%ORG_FLR%', '%DEST_FLR%',
+    '%CODE_ZIP%', '%ZIP_CODE%', '%POSTAL_CODE%', 
+    '%PHONE%', '%PHON_%', '%CONTACT_NUMBER%', '%_FAX_%', 
+    '%TITL_SHPR%', '%SHPR_TITL%', '%CUST_TITLE%', '%INIT_SHPR%', '%SHPR_INIT%', 
+    '%CUST_MIDDLE%', '%NAME_SECONDARY%'
+]
+
+###############################################
+# 3. HELPER FUNCTION TO FIND MATCHING COLUMNS
+###############################################
+
+def get_matching_columns(session, db, table_name, patterns):
+    # Generate ILIKE filter expressions from patterns
+    filter_expr = " OR ".join([f"COLUMN_NAME ILIKE '{p}'" for p in patterns])
+    return session.sql(f"""
+        SELECT COLUMN_NAME
+        FROM {db}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = '{table_name}'
+          AND ({filter_expr})
+    """)
+
+#########################################
+# 4. MAIN FUNCTION - PERFORM SEARCH, LOG
+#########################################
 
 def main(session: snowpark.Session):
+
     combined_results = []
 
+    # Loop through all configured databases
     for db in databases:
         session.use_database(db)
         session.use_schema(schema)
 
+        # Execute the query to find all email-matching columns
         result_df = session.sql(sql_template)
         queries = result_df.collect()
 
@@ -62,39 +113,22 @@ def main(session: snowpark.Session):
             column_name = row["COLUMN_NAME"]
 
             select_all_query = f"SELECT * FROM {db}.{table_schema}.{table_name} WHERE {column_name} IN ('{email_submitted}');"
-
             print("🔍 Executing search query:", query)
-            print("📄 Full object name:", f"{db}.{table_schema}.{table_name}")
+
+            # Identify other customer and related fields in the table
+            try:
+                customer_df = get_matching_columns(session, db, table_name, customer_patterns)
+                customer_columns = ", ".join(dict.fromkeys([r["COLUMN_NAME"] for r in customer_df.collect()]))
+            except Exception as e:
+                customer_columns = f"<error: {str(e)}>"
 
             try:
-                customer_df = session.sql(f"""
-                    SELECT COLUMN_NAME
-                    FROM {db}.INFORMATION_SCHEMA.COLUMNS
-                    WHERE TABLE_NAME = '{table_name}'
-                        AND COLUMN_NAME ILIKE ANY (...)
-                """)
-                customer_list = list(dict.fromkeys([r["COLUMN_NAME"] for r in customer_df.collect()]))
+                related_df = get_matching_columns(session, db, table_name, related_patterns)
+                related_columns = ", ".join(dict.fromkeys([r["COLUMN_NAME"] for r in related_df.collect()]))
             except Exception as e:
-                customer_list = [f"<error: {str(e)}>"]
+                related_columns = f"<error: {str(e)}>"
 
-            try:
-                related_df = session.sql(f"""
-                    SELECT COLUMN_NAME
-                    FROM {db}.INFORMATION_SCHEMA.COLUMNS
-                    WHERE TABLE_NAME = '{table_name}'
-                        AND COLUMN_NAME ILIKE ANY (...)
-                """)
-                related_list = list(dict.fromkeys([r["COLUMN_NAME"] for r in related_df.collect()]))
-            except Exception as e:
-                related_list = [f"<error: {str(e)}>"]
-
-            customer_set = set(customer_list)
-            related_set = set(related_list)
-            all_columns = list(dict.fromkeys(customer_list + related_list))
-
-            customer_columns = ", ".join(customer_set)
-            related_columns = ", ".join(related_set)
-
+            # Execute the email search query
             try:
                 result = session.sql(query).collect()
                 for r in result:
@@ -104,6 +138,7 @@ def main(session: snowpark.Session):
             except Exception as e:
                 combined_results.append((query, f"<error: {str(e)}>", db, schema, select_all_query, customer_columns, related_columns))
 
+    # Define result schema
     result_schema = StructType([
         StructField("query", StringType()),
         StructField("result", StringType()),
@@ -114,35 +149,36 @@ def main(session: snowpark.Session):
         StructField("related_columns", StringType())
     ])
 
+    # Pad results to 7 fields if needed
     combined_results = [r if len(r) == 7 else r + ("",) * (7 - len(r)) for r in combined_results]
     result_df = session.create_dataframe(combined_results, schema=result_schema)
 
+    # Filter out errors and no matches
     result_df = result_df.filter(
         (col("result").is_not_null()) &
         (col("result") != lit("<no match>")) &
         (trim(left(col("result"), 7)) != lit("<error:"))
     )
 
-    if result_df.count() == 0:
-        print("⚠️ No matching records found. Skipping update and log write.")
-        return None
+    # Add metadata columns and drop unnecessary fields
+    result_df = result_df.drop('result', 'query')
+    result_df = result_df.with_column("email_address", lit(email_submitted))
+    result_df = result_df.with_column("search_datetime", current_timestamp())
+    result_df = result_df.drop_duplicates('select_all_query')
 
-    result_df = result_df.drop('result', 'query') \
-        .with_column("email_address", lit(email_submitted)) \
-        .with_column("search_datetime", current_timestamp()) \
-        .drop_duplicates('select_all_query')
-
+    # Log results in permanent table
     result_df.write.mode("append").save_as_table("prd_mart.data_anonymization.search_records_log")
 
-    latest_time = session.table("prd_mart.data_anonymization.search_records_log").agg(max("search_datetime").alias("latest_time")).collect()[0]["LATEST_TIME"]
+##############################################
+# 5. EXECUTE DATA ANONYMIZATION UPDATES
+##############################################
 
-    log_df = session.table("prd_mart.data_anonymization.search_records_log")\
-        .filter(col("search_datetime") == lit(latest_time))\
+    latest_time = session.table("prd_mart.data_anonymization.search_records_log") \
+        .agg(max("search_datetime").alias("latest_time")).collect()[0]["LATEST_TIME"]
+
+    log_df = session.table("prd_mart.data_anonymization.search_records_log") \
+        .filter(col("search_datetime") == lit(latest_time)) \
         .select("database", "schema", "select_all_query", "customer_columns", "related_columns")
-
-    if log_df.count() == 0:
-        print("⚠️ No update log entries found — skipping update process.")
-        return None
 
     for row in log_df.collect():
         db = row["DATABASE"]
@@ -152,17 +188,23 @@ def main(session: snowpark.Session):
 
         print("🔄 Preparing update for:", select_query)
 
-        customer_set = set(c.strip() for c in customer_cols.split(",") if c.strip())
-        related_set = set(c.strip() for c in related_cols.split(",") if c.strip())
+        if not customer_cols or customer_cols.startswith("<error"):
+            continue
 
-        column_update_map = {col: "'Removed'" for col in customer_set}
-        for col in related_set - customer_set:
-            column_update_map[col] = "''"
+        update_sets = []
 
-        update_sets = [f"{col} = {val}" for col, val in column_update_map.items()]
+        # Anonymize customer fields
+        for col_name in [c.strip() for c in customer_cols.split(",") if c.strip()]:
+            update_sets.append(f"{col_name} = 'Removed'")
+
+        # Blank out related fields
+        for col_name in [c.strip() for c in related_cols.split(",") if c.strip()]:
+            update_sets.append(f"{col_name} = ''")
+
         if not update_sets:
             continue
 
+        # Parse the table and where clause
         match = re.match(r"SELECT \* FROM (.+?) WHERE (.+);", select_query)
         if not match:
             continue
@@ -170,12 +212,19 @@ def main(session: snowpark.Session):
         full_table = match.group(1)
         where_clause = match.group(2)
 
+        # Grant update permissions
         try:
             session.sql(f"GRANT UPDATE ON {full_table} TO ROLE SYSADMIN").collect()
         except Exception as e:
             print(f"⚠️ Failed to grant update on {full_table}: {e}")
 
-        update_sql = f"UPDATE {full_table} SET {', '.join(update_sets)} WHERE {where_clause};"
+        # Build and execute the UPDATE statement
+        update_sql = f"""
+            UPDATE {full_table}
+            SET {', '.join(update_sets)}
+            WHERE {where_clause};
+        """
+
         print("🛠 Executing update SQL:", update_sql)
 
         try:
@@ -185,9 +234,9 @@ def main(session: snowpark.Session):
         except Exception as e:
             print(f"❌ Error updating {full_table}: {e}")
 
-    if result_df.count() == 0:
-        print("⚠️ No updates occurred, skipping summary logging.")
-        return None
+##############################################
+# 6. LOG SUMMARY IN COMPLETED_REQUESTS TABLE
+##############################################
 
     session.sql("""
     CREATE TABLE IF NOT EXISTS PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS (
@@ -199,6 +248,7 @@ def main(session: snowpark.Session):
     )
     """).collect()
 
+    # Aggregate log metrics
     databases_updated = set()
     tables_updated = set()
     columns_updated = 0
@@ -213,17 +263,23 @@ def main(session: snowpark.Session):
 
         match = re.match(r"SELECT \* FROM\s+([^.]+\.[^.]+\.[^.]+)\s+WHERE", query)
         if match:
-            tables_updated.add(match.group(1))
+            full_table = match.group(1)
+            tables_updated.add(full_table)
 
-        columns_updated += len(set(c.strip() for c in (customer_cols + "," + related_cols).split(",") if c.strip()))
+        customer_list = [c.strip() for c in customer_cols.split(",") if c.strip()]
+        related_list = [c.strip() for c in related_cols.split(",") if c.strip()]
+        columns_updated += len(customer_list) + len(related_list)
 
-    summary_data = [(
-        email_submitted,
-        datetime.now(),
-        len(databases_updated),
-        len(tables_updated),
-        columns_updated
-    )]
+    # Write to summary table
+    summary_data = [
+        (
+            email_submitted,
+            datetime.now(),
+            len(databases_updated),
+            len(tables_updated),
+            columns_updated
+        )
+    ]
 
     summary_schema = StructType([
         StructField("CUSTOMER_EMAIL", StringType()),
@@ -236,5 +292,5 @@ def main(session: snowpark.Session):
     summary_df = session.create_dataframe(summary_data, schema=summary_schema)
     summary_df.write.mode("append").save_as_table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
 
-    print("✅ Script completed. Review logs for details.")
+    # Return summary for validation/debug
     return session.table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
