@@ -17,7 +17,7 @@ This Snowflake Snowpark Python script is designed to **search for, log, and mask
 
 ## Configuration
 Update the following variables in the script:
-- email_submitted = "tsteussie@gmail.com"  # Target email to search
+- email_submitted = "examplegmail.com"  # Target email to search
 - databases = ["DEV_COPY", "PRD_COPY"]  # Databases to search
 - schema = "PUBLIC"  # Schema to use
 
