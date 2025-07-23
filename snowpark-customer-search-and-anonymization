@@ -1,296 +1,606 @@
 import snowflake.snowpark as snowpark
-from snowflake.snowpark.functions import *
-from snowflake.snowpark.types import *
-from datetime import datetime
-import re
+from snowflake.snowpark.functions import col, upper, lower, trim, lit, current_timestamp, when, count, sum as sf_sum, coalesce
+from snowflake.snowpark import Session
+from functools import reduce
+from collections import defaultdict
+from functools import reduce
 
-####################################
-# 1. SETUP VARIABLES AND CONNECTIONS
-####################################
+email_submitted = "test@gmail.com"
+search_databases = ["PRD_COPY","PRD_LAKE","PRD_WORK","DEV_COPY","DEV_LAKE","DEV_WORK"] 
 
-# Email address to search for and anonymize
-email_submitted = "example@gmail.com"
-
-# List of Snowflake databases to search
-databases = ["DEV_COPY", "PRD_COPY", "PRD_LAKE"]
-
-# Schema to use within each database
-schema = "PUBLIC"
-
-# SQL template to find matching email columns in tables
-sql_template = f"""
-SELECT
-    'SELECT ' || COLUMN_NAME ||
-    ' FROM ' || TABLE_SCHEMA || '.' || TABLE_NAME ||
-    ' WHERE ' || COLUMN_NAME || ' IN (''{email_submitted}'');' AS query,
-    TABLE_NAME,
-    TABLE_SCHEMA,
-    COLUMN_NAME
-FROM INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_NAME IN (
-    SELECT a.table_name
-    FROM INFORMATION_SCHEMA.TABLES a
-    WHERE a.table_type = 'BASE TABLE'
-      AND a.table_name IN (
-        SELECT TABLE_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS b
-        WHERE b.COLUMN_NAME ILIKE '%email%'
-      )
-)
-AND COLUMN_NAME ILIKE '%email%'
-AND DATA_TYPE IN ('TEXT', 'VARCHAR')
-"""
-
-# Snowflake connection parameters
 connection_parameters = {
     "role": "SYSADMIN",
-    "warehouse": "DNA_WH",
+    "warehouse": "DNA_WH"
 }
 
-####################################
-# 2. DEFINE COLUMN PATTERNS TO MATCH
-####################################
+# -----------------------------------------------------------------------------
+# SECTION 1: SPECIFY INCLUSION & EXCLUSION CRITERIA USING PYTHON DSL
+# -----------------------------------------------------------------------------
 
-# Columns that may contain customer names
-customer_patterns = [
-    '%NAME_CNSE%', '%CNSE_NAME%', '%NAME_CNSR%', '%CNSR_NAME%',
-    '%NAME_BILL%', '%BILL_TO_NAME%', '%ATTN_BILL_TO%',
-    '%CUST_LAST%', '%CUST_FIRST%',
-    '%NAME_LAST%', '%NAME_LST%', '%LAST_NAME%', '%LST_NAME%',
-    '%NAME_FIRST%', '%NAME_FRST%', '%FIRST_NAME%', '%FRST_NAME%',
-    '%SHPR_NAME%', '%NAME_SHPR%', '%SHPR_LAST%', 
-    '%SHPR_LST%', '%SHPR_FIRST%', '%SHPR_FRST%', '%INIT_SHPR%', '%NAME_CONT%',
-    '%NAME_CMPY_ORG%', '%NAME_CMPY_DEST%', '%NAME_NTFY%', '%AUTH_ANSR%'
-]
+# Primary Filter Conditions
+filter_cond = (
+       (col("COLUMN_NAME") == "NAME")
+    |  (col("COLUMN_NAME") == "COMPANY")
+    |  (col("COLUMN_NAME") == "SSN")
+    |  (col("COLUMN_NAME") == "CITY")
+    |  (col("COLUMN_NAME") == "PRINCIPAL")
+    |  upper(col("COLUMN_NAME")).like("%SSN_%")
+    |  upper(col("COLUMN_NAME")).like("%_SSN%")
+    |  upper(col("COLUMN_NAME")).like("%DATE_OF_BIRTH%")
+    |  upper(col("COLUMN_NAME")).like("%NAME_FRST%")
+    |  upper(col("COLUMN_NAME")).like("%NAME_FIRST%")
+    |  upper(col("COLUMN_NAME")).like("%FRST_NAME%")
+    |  upper(col("COLUMN_NAME")).like("%FIRST_NAME%")
+    |  upper(col("COLUMN_NAME")).like("%NAME_LAST%")
+    |  upper(col("COLUMN_NAME")).like("%LAST_NAME%")
+    |  upper(col("COLUMN_NAME")).like("%LEGAL_NAME%")
+    |  upper(col("COLUMN_NAME")).like("%ATTN_NAME%")
+    |  upper(col("COLUMN_NAME")).like("%SHPR%")
+    |  upper(col("COLUMN_NAME")).like("%DBA_NAME%")
+    |  upper(col("COLUMN_NAME")).like("%_INIT%")
+    |  upper(col("COLUMN_NAME")).like("%_MID%")
+    |  upper(col("COLUMN_NAME")).like("%MID_%")
+    |  upper(col("COLUMN_NAME")).like("%TITL%")
+    |  upper(col("COLUMN_NAME")).like("%SUFFIX%")
+    |  upper(col("COLUMN_NAME")).like("%DEPT_NAME%")
+    |  upper(col("COLUMN_NAME")).like("%ADDRESS%")
+    |  upper(col("COLUMN_NAME")).like("%ADDR1%")
+    |  upper(col("COLUMN_NAME")).like("%ADDR2%")
+    |  upper(col("COLUMN_NAME")).like("%ORIG_ADDR%")
+    |  upper(col("COLUMN_NAME")).like("%ORG_ADDR%")
+    |  upper(col("COLUMN_NAME")).like("%ADDR_OR%")
+    |  upper(col("COLUMN_NAME")).like("%DEST_ADDR%")
+    |  upper(col("COLUMN_NAME")).like("%ADDR_DEST%")
+    |  upper(col("COLUMN_NAME")).like("%ADDR_NAGT%")
+    |  upper(col("COLUMN_NAME")).like("%STRE_%")
+    |  upper(col("COLUMN_NAME")).like("%CITY_%")
+    |  upper(col("COLUMN_NAME")).like("%_CITY%")
+    |  upper(col("COLUMN_NAME")).like("%ZIP%")
+    |  upper(col("COLUMN_NAME")).like("%POSTAL%")
+    |  upper(col("COLUMN_NAME")).like("%POST_CODE%")
+    |  upper(col("COLUMN_NAME")).like("%PHON%")
+    |  upper(col("COLUMN_NAME")).like("%ITUDE%")
+    |  upper(col("COLUMN_NAME")).like("%_LAT_%")
+    |  upper(col("COLUMN_NAME")).like("%_LONG_%")
+    |  upper(col("COLUMN_NAME")).like("%IP_ADDRESS%")
+    |  upper(col("COLUMN_NAME")).like("%IPADDRESS%")
+    |  upper(col("COLUMN_NAME")).like("%EMAIL%")
+    |  upper(col("COLUMN_NAME")).like("%E_MAIL%")
+)
 
-# Related data fields to anonymize (e.g., address, phone, etc.)
-related_patterns = [
-    '%EMAIL%', '%ADDR_%', '%_ADDR%', '%ADDR1%', '%ADDR2%',
-    '%STREET%', '%STRE_ORG%', '%STRE_DEST%', '%_PO_%', '%POBOX%',
-    '%_CITY%', '%CITY_%', 
-    '%APT_ORG%', '%APT_DEST%', '%ORG_APT%', '%DEST_APT%', '%FLR_ORG%', '%FLR_DEST%', '%ORG_FLR%', '%DEST_FLR%',
-    '%CODE_ZIP%', '%ZIP_CODE%', '%POSTAL_CODE%', 
-    '%PHONE%', '%PHON_%', '%CONTACT_NUMBER%', '%_FAX_%', 
-    '%TITL_SHPR%', '%SHPR_TITL%', '%CUST_TITLE%', '%INIT_SHPR%', '%SHPR_INIT%', 
-    '%CUST_MIDDLE%', '%NAME_SECONDARY%'
-]
+# Primary Exclusion Conditions
+exclude_cond = (
+    ~col("DATA_TYPE").isin("DATE","DATETIME","TIMESTAMP","TIMESTAMP_NTZ","TIMESTAMP_LTZ","TIMESTAMP_TZ","BOOLEAN","VARBINARY")
+    &  ~upper(col("COLUMN_NAME")).like("%DATE%")
+    &  ~upper(col("COLUMN_NAME")).like("%DAYS%")
+    &  ~upper(col("COLUMN_NAME")).like("%DLAY_NTFY%")
+    &  ~upper(col("COLUMN_NAME")).like("%EMAIL_BOUNCE%")
+    &  ~upper(col("COLUMN_NAME")).like("%EMAIL_CLICK%")
+    &  ~upper(col("COLUMN_NAME")).like("%EMAIL_DELIVERED%")
+    &  ~upper(col("COLUMN_NAME")).like("%EMAIL_OPEN%")
+    &  ~upper(col("COLUMN_NAME")).like("%EMAIL_REPLIED%")
+    &  ~upper(col("COLUMN_NAME")).like("%INFO%")
+    &  ~upper(col("COLUMN_NAME")).like("%LATE%")
+    &  ~upper(col("COLUMN_NAME")).like("%LEAD_COORDINATOR%")
+    &  ~upper(col("COLUMN_NAME")).like("%MOVE_COORDINATOR%")
+    &  ~upper(col("COLUMN_NAME")).like("%OPPORTUNITY%")
+    &  ~upper(col("COLUMN_NAME")).like("%OPTY%")
+    &  ~upper(col("COLUMN_NAME")).like("%REASON%")
+    &  ~upper(col("COLUMN_NAME")).like("%STATUS%")
+    &  ~upper(col("COLUMN_NAME")).like("%TYPE%")
+    &  ~upper(col("COLUMN_NAME")).like("%_PK%")
+    &  ~upper(col("COLUMN_NAME")).like("%_FK%")
+    &  ~upper(col("COLUMN_NAME")).like("%_IND")
+    &  ~upper(col("COLUMN_NAME")).like("%_ID")
+    &  ~upper(col("COLUMN_NAME")).like("Q1%")
+    &  ~upper(col("COLUMN_NAME")).like("Q2%")
+    &  ~upper(col("COLUMN_NAME")).like("Q3%")
+    &  ~upper(col("COLUMN_NAME")).like("Q4%")
+    &  ~upper(col("COLUMN_NAME")).like("Q5%")
+    &  ~upper(col("COLUMN_NAME")).like("Q6%")
+)
 
-###############################################
-# 3. HELPER FUNCTION TO FIND MATCHING COLUMNS
-###############################################
+# Override previous criteria to EXCLUDE specified column names
+remove_cond = col("COLUMN_NAME").isin(
+    "AGENTEMAILSTATUS",
+    "BILL_TO_AGNT_NBR",
+    "BILL_TO_TYPE", 
+    "BOKR_EMAIL",
+    "CARRIER_EMAIL",
+    "CUSTOMEREMAILSTATUS",
+    "CUSTOMER_DIM_FK",
+    "EMAIL_TC",
+    "ID_RANK_SHPR",
+    "INDT_CONT_DEST",
+    "INDT_FLR_FLAT",
+    "INDT_NTFY_GBNR",
+    "INDT_SHPR_NTFY",
+    "MOVE_MNGR_EMAIL",
+    "ST_ISTL_MILI", 
+    "UNI_VOICEMAIL_DESC",
+    "ZIP_DIVS",
+)
 
-def get_matching_columns(session, db, table_name, patterns):
-    # Generate ILIKE filter expressions from patterns
-    filter_expr = " OR ".join([f"COLUMN_NAME ILIKE '{p}'" for p in patterns])
-    return session.sql(f"""
-        SELECT COLUMN_NAME
-        FROM {db}.INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = '{table_name}'
-          AND ({filter_expr})
-    """)
+# Override previous criteria to ADD BACK specified column names
+override_cond = (
+    (col("COLUMN_NAME") == "COMPANY") | 
+    (col("COLUMN_NAME") == "CONTRACT_NAME") |
+    (col("COLUMN_NAME") == "DEALNAME") |
+    (col("COLUMN_NAME") == "DESTINATION_POSTAL_ID") |
+    (col("COLUMN_NAME") == "MOVE_PRTY_MSG_TEXT") |
+    (col("COLUMN_NAME") == "NAME_ACCT") |
+    (col("COLUMN_NAME") == "ORIGIN_POSTAL_ID") |
+    (col("COLUMN_NAME") == "POSTAL_ID") |
+    (col("COLUMN_NAME") == "REMOTENUMBERCALLID") |
+    (col("COLUMN_NAME") == "SMS_ADDR_DESC")
+)
 
-#########################################
-# 4. MAIN FUNCTION - PERFORM SEARCH, LOG
-#########################################
+# -----------------------------------------------------------------------------
+# SECTION 2: IDENTIFY EMAIL COLUMNS THAT CONTAIN THE SUBMITTED ADDRESS
+# -----------------------------------------------------------------------------
 
-def main(session: snowpark.Session):
+def search_and_store_email_locations(session: Session,
+                                     email_address: str,
+                                     db_list: list[str] = search_databases):
+    print("🔎 Scanning databases:", db_list)
+    target = email_address.upper()
+    hits: list[tuple[str,str,str,str]] = []
+    table_counts: dict[str,int] = {}
 
-    combined_results = []
-
-    # Loop through all configured databases
-    for db in databases:
-        session.use_database(db)
-        session.use_schema(schema)
-
-        # Execute the query to find all email-matching columns
-        result_df = session.sql(sql_template)
-        queries = result_df.collect()
-
-        for row in queries:
-            query = row["QUERY"]
-            table_name = row["TABLE_NAME"]
-            table_schema = row["TABLE_SCHEMA"]
-            column_name = row["COLUMN_NAME"]
-
-            select_all_query = f"SELECT * FROM {db}.{table_schema}.{table_name} WHERE {column_name} IN ('{email_submitted}');"
-            print("🔍 Executing search query:", query)
-
-            # Identify other customer and related fields in the table
-            try:
-                customer_df = get_matching_columns(session, db, table_name, customer_patterns)
-                customer_columns = ", ".join(dict.fromkeys([r["COLUMN_NAME"] for r in customer_df.collect()]))
-            except Exception as e:
-                customer_columns = f"<error: {str(e)}>"
-
-            try:
-                related_df = get_matching_columns(session, db, table_name, related_patterns)
-                related_columns = ", ".join(dict.fromkeys([r["COLUMN_NAME"] for r in related_df.collect()]))
-            except Exception as e:
-                related_columns = f"<error: {str(e)}>"
-
-            # Execute the email search query
-            try:
-                result = session.sql(query).collect()
-                for r in result:
-                    combined_results.append((query, str(r), db, schema, select_all_query, customer_columns, related_columns))
-                if not result:
-                    combined_results.append((query, "<no match>", db, schema, select_all_query, customer_columns, related_columns))
-            except Exception as e:
-                combined_results.append((query, f"<error: {str(e)}>", db, schema, select_all_query, customer_columns, related_columns))
-
-    # Define result schema
-    result_schema = StructType([
-        StructField("query", StringType()),
-        StructField("result", StringType()),
-        StructField("database", StringType()),
-        StructField("schema", StringType()),
-        StructField("select_all_query", StringType()),
-        StructField("customer_columns", StringType()),
-        StructField("related_columns", StringType())
-    ])
-
-    # Pad results to 7 fields if needed
-    combined_results = [r if len(r) == 7 else r + ("",) * (7 - len(r)) for r in combined_results]
-    result_df = session.create_dataframe(combined_results, schema=result_schema)
-
-    # Filter out errors and no matches
-    result_df = result_df.filter(
-        (col("result").is_not_null()) &
-        (col("result") != lit("<no match>")) &
-        (trim(left(col("result"), 7)) != lit("<error:"))
-    )
-
-    # Add metadata columns and drop unnecessary fields
-    result_df = result_df.drop('result', 'query')
-    result_df = result_df.with_column("email_address", lit(email_submitted))
-    result_df = result_df.with_column("search_datetime", current_timestamp())
-    result_df = result_df.drop_duplicates('select_all_query')
-
-    # Log results in permanent table
-    result_df.write.mode("append").save_as_table("prd_mart.data_anonymization.search_records_log")
-
-##############################################
-# 5. EXECUTE DATA ANONYMIZATION UPDATES
-##############################################
-
-    latest_time = session.table("prd_mart.data_anonymization.search_records_log") \
-        .agg(max("search_datetime").alias("latest_time")).collect()[0]["LATEST_TIME"]
-
-    log_df = session.table("prd_mart.data_anonymization.search_records_log") \
-        .filter(col("search_datetime") == lit(latest_time)) \
-        .select("database", "schema", "select_all_query", "customer_columns", "related_columns")
-
-    for row in log_df.collect():
-        db = row["DATABASE"]
-        select_query = row["SELECT_ALL_QUERY"]
-        customer_cols = row["CUSTOMER_COLUMNS"]
-        related_cols = row["RELATED_COLUMNS"]
-
-        print("🔄 Preparing update for:", select_query)
-
-        if not customer_cols or customer_cols.startswith("<error"):
-            continue
-
-        update_sets = []
-
-        # Anonymize customer fields
-        for col_name in [c.strip() for c in customer_cols.split(",") if c.strip()]:
-            update_sets.append(f"{col_name} = 'Removed'")
-
-        # Blank out related fields
-        for col_name in [c.strip() for c in related_cols.split(",") if c.strip()]:
-            update_sets.append(f"{col_name} = ''")
-
-        if not update_sets:
-            continue
-
-        # Parse the table and where clause
-        match = re.match(r"SELECT \* FROM (.+?) WHERE (.+);", select_query)
-        if not match:
-            continue
-
-        full_table = match.group(1)
-        where_clause = match.group(2)
-
-        # Grant update permissions
-        try:
-            session.sql(f"GRANT UPDATE ON {full_table} TO ROLE SYSADMIN").collect()
-        except Exception as e:
-            print(f"⚠️ Failed to grant update on {full_table}: {e}")
-
-        # Build and execute the UPDATE statement
-        update_sql = f"""
-            UPDATE {full_table}
-            SET {', '.join(update_sets)}
-            WHERE {where_clause};
-        """
-
-        print("🛠 Executing update SQL:", update_sql)
-
-        try:
-            update_result = session.sql(update_sql).collect()
-            rows_updated = update_result[0]['rows_updated'] if update_result and 'rows_updated' in update_result[0] else "unknown"
-            print(f"✅ Updated {full_table} — Rows affected: {rows_updated}")
-        except Exception as e:
-            print(f"❌ Error updating {full_table}: {e}")
-
-##############################################
-# 6. LOG SUMMARY IN COMPLETED_REQUESTS TABLE
-##############################################
-
-    session.sql("""
-    CREATE TABLE IF NOT EXISTS PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS (
-        CUSTOMER_EMAIL STRING,
-        UPDATE_DATETIME TIMESTAMP_NTZ,
-        DATABASES_UPDATED INT,
-        TABLES_UPDATED INT,
-        COLUMNS_UPDATED INT
-    )
-    """).collect()
-
-    # Aggregate log metrics
-    databases_updated = set()
-    tables_updated = set()
-    columns_updated = 0
-
-    for row in result_df.collect():
-        db = row["DATABASE"]
-        query = row["SELECT_ALL_QUERY"]
-        customer_cols = row["CUSTOMER_COLUMNS"]
-        related_cols = row["RELATED_COLUMNS"]
-
-        databases_updated.add(db)
-
-        match = re.match(r"SELECT \* FROM\s+([^.]+\.[^.]+\.[^.]+)\s+WHERE", query)
-        if match:
-            full_table = match.group(1)
-            tables_updated.add(full_table)
-
-        customer_list = [c.strip() for c in customer_cols.split(",") if c.strip()]
-        related_list = [c.strip() for c in related_cols.split(",") if c.strip()]
-        columns_updated += len(customer_list) + len(related_list)
-
-    # Write to summary table
-    summary_data = [
-        (
-            email_submitted,
-            datetime.now(),
-            len(databases_updated),
-            len(tables_updated),
-            columns_updated
+    for db in db_list:
+        # Look only at base tables
+        tables_meta = (
+            session.table(f"{db}.INFORMATION_SCHEMA.TABLES")
+                   .filter(col("TABLE_TYPE") == "BASE TABLE")
+                   .select("TABLE_SCHEMA","TABLE_NAME")
         )
+
+        # Find any columns whose name looks like email
+        email_cols = (
+            session.table(f"{db}.INFORMATION_SCHEMA.COLUMNS")
+                   .join(tables_meta, ["TABLE_SCHEMA","TABLE_NAME"], how="inner")
+                   .filter(
+                       upper(col("COLUMN_NAME")).like("%EMAIL%")
+                    |  upper(col("COLUMN_NAME")).like("%E_MAIL%")
+                   )
+                   .select(
+                       lit(db).alias("DATABASE_NAME"),
+                       col("TABLE_SCHEMA"),
+                       col("TABLE_NAME"),
+                       col("COLUMN_NAME")
+                   )
+        ).collect()
+
+        for row in email_cols:
+            d, s, t, c = row["DATABASE_NAME"], row["TABLE_SCHEMA"], row["TABLE_NAME"], row["COLUMN_NAME"]
+            table_id = f"{d}.{s}.{t}"
+
+            # get and cache total row count
+            if table_id not in table_counts:
+                try:
+                    table_counts[table_id] = session.table(table_id).count()
+                except Exception:
+                    table_counts[table_id] = None
+
+            try:
+                tbl = session.table(table_id)
+                match_count = tbl.filter(upper(col(c)).like(f"%{target}%")).count()
+            except Exception:
+                continue
+
+            if match_count > 0:
+                total_rows = table_counts[table_id]
+                if total_rows is not None:
+                    print(f"ℹ️ {table_id}.{c}: {match_count} of {total_rows} rows match the submitted email")
+                else:
+                    print(f"ℹ️ {table_id}.{c}: {match_count} matching rows")
+
+                hits.append((d, s, t, c))
+
+    if not hits:
+        print(f"ℹ️ No matching email values found for {email_address} in {db_list} — stopping.")
+        return []
+
+    # write out only the hit-columns
+    rows = [
+        {"DATABASE_NAME": d, "TABLE_SCHEMA": s, "TABLE_NAME": t, "COLUMN_NAME": c}
+        for d, s, t, c in hits
     ]
+    result_df = (
+        session.create_dataframe(rows)
+               .with_column("SEARCHED_EMAIL", lit(email_address))
+               .with_column("SEARCH_TIMESTAMP", current_timestamp())
+    )
 
-    summary_schema = StructType([
-        StructField("CUSTOMER_EMAIL", StringType()),
-        StructField("UPDATE_DATETIME", TimestampType()),
-        StructField("DATABASES_UPDATED", IntegerType()),
-        StructField("TABLES_UPDATED", IntegerType()),
-        StructField("COLUMNS_UPDATED", IntegerType())
-    ])
+    session.sql(
+        "DROP TABLE IF EXISTS PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS"
+    ).collect()
+    result_df.write.mode("overwrite").save_as_table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
 
-    summary_df = session.create_dataframe(summary_data, schema=summary_schema)
-    summary_df.write.mode("append").save_as_table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
+    return hits
 
-    # Return summary for validation/debug
-    return session.table("PRD_MART.DATA_ANONYMIZATION.COMPLETED_REQUESTS")
+# -----------------------------------------------------------------------------
+# SECTION 3: GRANT PRIVILEGES TO SYSADMIN
+# -----------------------------------------------------------------------------
+
+def grant_privileges(session: snowpark.Session):
+    """
+    Grant USAGE and UPDATE privileges only on the databases, schemas, and tables
+    where the submitted email was actually found (per EMAIL_SEARCH_RESULTS),
+    but restricted to the configured `search_databases`.
+    """
+    print(" ")
+    print("🔐 Granting scoped privileges based on EMAIL_SEARCH_RESULTS...")
+    print("🔐 Restricting to databases:", search_databases)
+
+    # Load and filter results to only your search_databases
+    results_df = (
+        session
+          .table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
+          .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
+          .distinct()
+          .filter(col("DATABASE_NAME").isin(search_databases))
+    )
+
+    # Bail early if nothing in your configured DBs
+    if results_df.count() == 0:
+        print(f"ℹ️ No matching entries in {search_databases}; nothing to grant.")
+        return
+
+    # Grant USAGE on each database in the filtered results
+    dbs = [row["DATABASE_NAME"] for row in results_df.select("DATABASE_NAME").distinct().collect()]
+    for db in dbs:
+        try:
+            session.sql(f"GRANT USAGE ON DATABASE {db} TO ROLE SYSADMIN").collect()
+            # print(f"🔑 Granted USAGE on database {db}")
+        except Exception as e:
+            print(f"⚠️ Failed to grant USAGE on database {db}: {e}")
+
+    # Grant USAGE on each schema in the filtered results
+    schemas = results_df.select("DATABASE_NAME", "TABLE_SCHEMA").distinct().collect()
+    for row in schemas:
+        schema_id = f"{row['DATABASE_NAME']}.{row['TABLE_SCHEMA']}"
+        try:
+            session.sql(f"GRANT USAGE ON SCHEMA {schema_id} TO ROLE SYSADMIN").collect()
+            # print(f"🔑 Granted USAGE on schema {schema_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to grant USAGE on schema {schema_id}: {e}")
+
+    # Grant UPDATE on each table in the filtered results
+    tables = results_df.select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME").distinct().collect()
+    for row in tables:
+        table_id = f"{row['DATABASE_NAME']}.{row['TABLE_SCHEMA']}.{row['TABLE_NAME']}"
+        try:
+            session.sql(f"GRANT UPDATE ON TABLE {table_id} TO ROLE SYSADMIN").collect()
+            # print(f"🔑 Granted UPDATE on table {table_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to grant UPDATE on table {table_id}: {e}")
+
+# -----------------------------------------------------------------------------
+# SECTION 4: CLASSIFY PII-RELATED COLUMNS 
+# -----------------------------------------------------------------------------
+
+def classify_columns(session: Session):
+    print(" ")
+    print("🔎 Classifying columns and counting total columns per table:")
+
+    # Load all tables from EMAIL_SEARCH_RESULTS (any email)
+    all_tables_df = (
+        session
+          .table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
+          .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
+          .distinct()
+    )
+    total_tables = all_tables_df.count()
+
+    # Filter to only include current email_submitted
+    filtered_tables_df = (
+        all_tables_df
+          .join(
+             session.table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS"),
+             ["DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME"],
+             how="inner"
+          )
+          .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
+          .distinct()
+    )
+    filtered_count = filtered_tables_df.count()
+    print(f"ℹ️ Tables matching '{email_submitted}': {filtered_count}")
+
+    # Use filtered_tables_df for downstream classification
+    tables_df = filtered_tables_df
+    tables = [(r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"])
+              for r in tables_df.collect()]
+    if not tables:
+        print("ℹ️ No tables found for this email — skipping classification.")
+        return
+
+    # Pull metadata for those tables
+    dbs = sorted({db for db, _, _ in tables})
+    meta_frames = []
+    for db in dbs:
+        tables_meta = (
+            session
+              .table(f"{db}.INFORMATION_SCHEMA.TABLES")
+              .filter(col("TABLE_TYPE") == "BASE TABLE")
+              .select("TABLE_SCHEMA", "TABLE_NAME")
+        )
+        cols = (
+            session
+              .table(f"{db}.INFORMATION_SCHEMA.COLUMNS")
+              .join(tables_meta, ["TABLE_SCHEMA", "TABLE_NAME"], how="inner")
+              .select(
+                  lit(db).alias("DATABASE_NAME"),
+                  col("TABLE_SCHEMA"),
+                  col("TABLE_NAME"),
+                  col("COLUMN_NAME"),
+                  col("DATA_TYPE"),
+                  col("CHARACTER_MAXIMUM_LENGTH")
+              )
+        )
+        meta_frames.append(cols)
+    meta = reduce(lambda a, b: a.union(b), meta_frames)
+
+    # Restrict to just the tables you care about
+    meta = meta.join(tables_df, ["DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME"], how="inner")
+
+    # Warn if any tables had no metadata
+    found   = set(meta.select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME").distinct().collect())
+    missing = set(tables) - found
+    if missing:
+        print(f"⚠️ No metadata found for these {len(missing)} tables: {missing}")
+
+    # Build and apply a single PII mask using DSL-based filters:
+    regular_mask  = filter_cond & exclude_cond & ~remove_cond
+    override_mask = override_cond
+    pii_mask_final = regular_mask | override_mask
+
+    # Apply the unified mask to get detailed PII columns
+    detailed_pre_df = meta.filter(pii_mask_final)
+
+    # Build a map of PII columns per table for printing
+    from collections import defaultdict
+    pii_map = defaultdict(list)
+    for r in detailed_pre_df.select(
+            "DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME"
+        ).collect():
+        pii_map[(r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"])].append(r["COLUMN_NAME"])
+
+    # Compute total vs. PII counts
+    flagged = meta.with_column("IS_PII", pii_mask_final)
+    summary_df = (
+        flagged
+          .group_by("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
+          .agg(
+            count("*").alias("TOTAL_COLUMNS"),
+            sf_sum(when(col("IS_PII"), 1).otherwise(0)).alias("PII_COLUMNS")
+          )
+    )
+    full_summary = (
+        filtered_tables_df
+          .join(summary_df, ["DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME"], how="left")
+          .select(
+            "DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME",
+            coalesce(col("TOTAL_COLUMNS"), lit(0)).alias("TOTAL_COLUMNS"),
+            coalesce(col("PII_COLUMNS"),   lit(0)).alias("PII_COLUMNS")
+          )
+    )
+
+    # Print the classification summary
+    for r in full_summary.collect():
+        db, schema, tbl = r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"]
+        tot, pii_ct     = r["TOTAL_COLUMNS"], r["PII_COLUMNS"]
+        cols = sorted(pii_map.get((db, schema, tbl), []))
+        print(f"ℹ️ {db}.{schema}.{tbl}: {pii_ct} of {tot} columns are PII → {cols}")
+
+    # Persist detailed classification
+    detailed_df = (
+        detailed_pre_df
+          .select(
+            "DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME",
+            when(
+                (upper(col("COLUMN_NAME")).like("%EMAIL%")) |
+                (upper(col("COLUMN_NAME")).like("%E_MAIL%")),
+                lit("EMAIL")
+            )
+            .when(col("DATA_TYPE") == "NUMBER", lit("NUMBER"))
+            .when(
+                col("CHARACTER_MAXIMUM_LENGTH").isNotNull()
+                & (col("CHARACTER_MAXIMUM_LENGTH") <= 7),
+                lit("SHORT_TEXT")
+            )
+            .when(
+                col("CHARACTER_MAXIMUM_LENGTH").isNull()
+                | (col("CHARACTER_MAXIMUM_LENGTH") > 7),
+                lit("LONG_TEXT")
+            )
+            .otherwise(col("DATA_TYPE"))
+            .alias("DATA_TYPE")
+          )
+          .with_column("CLASSIFY_TIMESTAMP", current_timestamp())
+    )
+
+    # Write dataframe to Snowflake
+    detailed_df.write.mode("overwrite").save_as_table("PRD_MART.DATA_ANONYMIZATION.DETAILED_COLUMN_CLASSIFICATION_LOG")
+    print("📥 Written detailed PII-column log to DETAILED_COLUMN_CLASSIFICATION_LOG")
+
+# -----------------------------------------------------------------------------
+# SECTION 5: APPLY NON-EMAIL ANONYMIZATION   
+# -----------------------------------------------------------------------------
+
+def apply_nonemail_anonymization(session: Session):
+    """
+    Mask NUMBER, SHORT_TEXT, and LONG_TEXT columns in tables
+    where the submitted email was found — filtering on the email columns.
+    """
+    print(" ")
+    print("🔄 Applying anonymization for NUMBER, SHORT_TEXT, and LONG_TEXT types...")
+
+    # Load detailed classification log
+    class_df = (
+        session
+        .table("PRD_MART.DATA_ANONYMIZATION.DETAILED_COLUMN_CLASSIFICATION_LOG")
+        .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE")
+    )
+
+    # Find which tables/columns contained the submitted email
+    search_rows = (
+        session
+        .table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
+        .filter(col("SEARCHED_EMAIL") == lit(email_submitted))
+        .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME")
+        .collect()
+    )
+
+    # Map each table to its email‐columns
+    from collections import defaultdict
+    email_cols_map: dict[tuple[str,str,str], list[str]] = defaultdict(list)
+    for r in search_rows:
+        key = (r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"])
+        email_cols_map[key].append(r["COLUMN_NAME"])
+
+    # Group columns by table for only for tables with submitted_email 
+    table_cols: dict[tuple[str,str,str], list[tuple[str,str]]] = defaultdict(list)
+    for row in class_df.collect():
+        key = (row["DATABASE_NAME"], row["TABLE_SCHEMA"], row["TABLE_NAME"])
+        dt = row["DATA_TYPE"].upper()
+        if dt in ("NUMBER", "SHORT_TEXT", "LONG_TEXT") and key in email_cols_map:
+            table_cols[key].append((row["COLUMN_NAME"], dt))
+
+    # For each affected table, execute a Table.update
+    from functools import reduce
+    for (db, schema, tbl), cols in table_cols.items():
+        table_id = f"{db}.{schema}.{tbl}"
+        tbl_obj = session.table(table_id)
+
+        # Build a case‐insensitive WHERE condition on the email columns
+        email_conds = [
+            lower(trim(col(email_col))) == lower(lit(email_submitted))
+            for email_col in email_cols_map[(db, schema, tbl)]
+        ]
+        where_cond = reduce(lambda a, b: a | b, email_conds)
+
+        # Build the assignments dict for update()
+        assignments = {
+            col_name: (
+                lit(0) if dt == "NUMBER"
+                else lit("") if dt == "SHORT_TEXT"
+                else lit("Removed") if dt == "LONG_TEXT"
+                else lit("")
+            )
+            for col_name, dt in cols
+        }
+        
+        try:
+            # ✅ call Table.update(assignments, condition)
+            tbl_obj.update(assignments, where_cond)
+            col_list = ", ".join(c for c, _ in cols)
+            print(f"✅ {table_id}: anonymized columns → {col_list}")
+        except Exception as e:
+            print(f"⚠️ Failed to anonymize {table_id}: {e}")
+
+# -----------------------------------------------------------------------------
+# SECTION 6: APPLY EMAIL ANONYMIZATION 
+# -----------------------------------------------------------------------------
+
+def apply_only_email_anonymization(session: Session):
+    """
+    Mask EMAIL columns in tables where the submitted email was found.
+    Reports how many rows match before & after, so you can spot leftovers.
+    """
+    
+    print("\n🔄 Applying anonymization for EMAIL types…")
+    target = email_submitted.upper()
+
+    # Load your classification log
+    class_df = (
+        session
+        .table("PRD_MART.DATA_ANONYMIZATION.DETAILED_COLUMN_CLASSIFICATION_LOG")
+        .select("DATABASE_NAME","TABLE_SCHEMA","TABLE_NAME","COLUMN_NAME","DATA_TYPE")
+    )
+
+    # Find which tables actually contained the email
+    search_rows = (
+        session
+        .table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
+        .filter(col("SEARCHED_EMAIL") == email_submitted)
+        .select("DATABASE_NAME","TABLE_SCHEMA","TABLE_NAME","COLUMN_NAME")
+        .collect()
+    )
+
+    # Build a map of email-columns *that you also tagged as EMAIL*
+    email_cols_map = defaultdict(list)
+    for r in search_rows:
+        key = (r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"])
+        # confirm it’s in the detailed log as DATA_TYPE = 'EMAIL'
+        is_email = (
+            class_df
+              .filter(
+                  (col("DATABASE_NAME")==r["DATABASE_NAME"]) &
+                  (col("TABLE_SCHEMA")==r["TABLE_SCHEMA"]) &
+                  (col("TABLE_NAME" )==r["TABLE_NAME" ]) &
+                  (col("COLUMN_NAME")==r["COLUMN_NAME"]) &
+                  (col("DATA_TYPE"  )=="EMAIL")
+              )
+              .count() > 0
+        )
+        if is_email:
+            email_cols_map[key].append(r["COLUMN_NAME"])
+
+    # For each table, do the LIKE-based update and diagnostics
+    for (db, schema, tbl), cols in email_cols_map.items():
+        table_id = f"{db}.{schema}.{tbl}"
+        tbl_obj  = session.table(table_id)
+
+        # build a substring‐match condition across all email columns
+        email_conds = [
+            upper(trim(col(c))).like(f"%{target}%")
+            for c in cols
+        ]
+        where_cond = reduce(lambda a, b: a | b, email_conds)
+
+        # How many rows *before*?
+        pre_count = tbl_obj.filter(where_cond).count()
+        print(f"🔍 {table_id}: {pre_count} rows match before anonymization")
+
+        if pre_count == 0:
+            print(f"   • skipping (no matching rows)")
+            continue
+
+        # Perform the update
+        assignments = {c: lit("Removed") for c in cols}
+        try:
+            tbl_obj.update(assignments, where_cond)
+            print(f"✅ {table_id}: anonymized columns → {', '.join(cols)}")
+        except Exception as e:
+            print(f"⚠️ FAILED to anonymize {table_id}: {e}")
+            continue
+
+        # Confirm how many rows *after* still match
+        post_count = tbl_obj.filter(where_cond).count()
+        if post_count > 0:
+            print(f"⚠️ {table_id}: {post_count} rows still contain the email after update")
+        else:
+            print(f"   • all rows cleared (0 remaining)")
+
+    print("🔔 EMAIL anonymization pass complete.\n")
+
+# -----------------------------------------------------------------------------
+# SECTION 7: MAIN FUNCTION ENTRY POINT
+# -----------------------------------------------------------------------------
+
+def main():
+    session = snowpark.Session.builder.configs(connection_parameters).create()
+    hits = search_and_store_email_locations(session, email_submitted, search_databases)
+    if not hits:
+        print(" ")
+        print("🔔 No tables contained the submitted email — nothing to anonymize.")
+        print(" ")
+        return
+    grant_privileges(session)
+    classify_columns(session)
+    apply_nonemail_anonymization(session)
+    apply_only_email_anonymization(session)
+    
+if __name__ == "__main__":
+    main()
