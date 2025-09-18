@@ -1,12 +1,17 @@
 import snowflake.snowpark as snowpark
+import snowflake.snowpark as snowpark
 from snowflake.snowpark.functions import col, upper, lower, trim, lit, current_timestamp, when, count, sum as sf_sum, coalesce
 from snowflake.snowpark import Session
 from functools import reduce
-from collections import defaultdict
-from functools import reduce
+from collections import defaultdict as dd
 
-email_submitted = "test@gmail.com"
-search_databases = ["PRD_COPY","PRD_LAKE","PRD_WORK","DEV_COPY","DEV_LAKE","DEV_WORK"] 
+email_submitted = "schneiderjohnh@gmail.com"
+
+# The following databases were not identified in historic data-anonymization requests: 'DEV_VAULT','PRD_VAULT','TST_VAULT','HANDLED','HUBSPOT_7508023'
+search_databases = ["DEV_COPY", "DEV_DBT", "DEV_INFODEPRC", "DEV_LAKE", "DEV_MART", "DEV_MART_STAGE", "DEV_WORK", \
+                    "PRD_COPY", "PRD_DBT", "PRD_INFODEPRC", "PRD_LAKE", "PRD_MART_STAGE", "PRD_WORK", \
+                    "TST_COPY", "TST_DB" , "TST_INFODEPRC", "TST_LAKE", "TST_MART", "TST_MART_STAGE", "TST_WORK", \
+                    "DEVELOPMENT", "PRODUCTION"]
 
 connection_parameters = {
     "role": "SYSADMIN",
@@ -22,7 +27,6 @@ filter_cond = (
        (col("COLUMN_NAME") == "NAME")
     |  (col("COLUMN_NAME") == "COMPANY")
     |  (col("COLUMN_NAME") == "SSN")
-    |  (col("COLUMN_NAME") == "CITY")
     |  (col("COLUMN_NAME") == "PRINCIPAL")
     |  upper(col("COLUMN_NAME")).like("%SSN_%")
     |  upper(col("COLUMN_NAME")).like("%_SSN%")
@@ -35,7 +39,6 @@ filter_cond = (
     |  upper(col("COLUMN_NAME")).like("%LAST_NAME%")
     |  upper(col("COLUMN_NAME")).like("%LEGAL_NAME%")
     |  upper(col("COLUMN_NAME")).like("%ATTN_NAME%")
-    |  upper(col("COLUMN_NAME")).like("%SHPR%")
     |  upper(col("COLUMN_NAME")).like("%DBA_NAME%")
     |  upper(col("COLUMN_NAME")).like("%_INIT%")
     |  upper(col("COLUMN_NAME")).like("%_MID%")
@@ -53,11 +56,6 @@ filter_cond = (
     |  upper(col("COLUMN_NAME")).like("%ADDR_DEST%")
     |  upper(col("COLUMN_NAME")).like("%ADDR_NAGT%")
     |  upper(col("COLUMN_NAME")).like("%STRE_%")
-    |  upper(col("COLUMN_NAME")).like("%CITY_%")
-    |  upper(col("COLUMN_NAME")).like("%_CITY%")
-    |  upper(col("COLUMN_NAME")).like("%ZIP%")
-    |  upper(col("COLUMN_NAME")).like("%POSTAL%")
-    |  upper(col("COLUMN_NAME")).like("%POST_CODE%")
     |  upper(col("COLUMN_NAME")).like("%PHON%")
     |  upper(col("COLUMN_NAME")).like("%ITUDE%")
     |  upper(col("COLUMN_NAME")).like("%_LAT_%")
@@ -102,6 +100,7 @@ exclude_cond = (
 
 # Override previous criteria to EXCLUDE specified column names
 remove_cond = col("COLUMN_NAME").isin(
+    "AGCY_LEAD_COORD_EMAIL",
     "AGENTEMAILSTATUS",
     "BILL_TO_AGNT_NBR",
     "BILL_TO_TYPE", 
@@ -110,11 +109,16 @@ remove_cond = col("COLUMN_NAME").isin(
     "CUSTOMEREMAILSTATUS",
     "CUSTOMER_DIM_FK",
     "EMAIL_TC",
+    "G11_AUTH_INIT",
     "ID_RANK_SHPR",
     "INDT_CONT_DEST",
     "INDT_FLR_FLAT",
     "INDT_NTFY_GBNR",
     "INDT_SHPR_NTFY",
+    "LOC_ADDR1_WHSE_DEST",
+    "LOC_ADDR2_WHSE_DEST",
+    "LOC_ADDR1_WHSE_ORG",
+    "LOC_ADDR2_WHSE_ORG",
     "MOVE_MNGR_EMAIL",
     "ST_ISTL_MILI", 
     "UNI_VOICEMAIL_DESC",
@@ -126,11 +130,8 @@ override_cond = (
     (col("COLUMN_NAME") == "COMPANY") | 
     (col("COLUMN_NAME") == "CONTRACT_NAME") |
     (col("COLUMN_NAME") == "DEALNAME") |
-    (col("COLUMN_NAME") == "DESTINATION_POSTAL_ID") |
     (col("COLUMN_NAME") == "MOVE_PRTY_MSG_TEXT") |
     (col("COLUMN_NAME") == "NAME_ACCT") |
-    (col("COLUMN_NAME") == "ORIGIN_POSTAL_ID") |
-    (col("COLUMN_NAME") == "POSTAL_ID") |
     (col("COLUMN_NAME") == "REMOTENUMBERCALLID") |
     (col("COLUMN_NAME") == "SMS_ADDR_DESC")
 )
@@ -142,7 +143,7 @@ override_cond = (
 def search_and_store_email_locations(session: Session,
                                      email_address: str,
                                      db_list: list[str] = search_databases):
-    print("🔎 Scanning databases:", db_list)
+    print("🔎 Scanning databases for", email_submitted, db_list)
     target = email_address.upper()
     hits: list[tuple[str,str,str,str]] = []
     table_counts: dict[str,int] = {}
@@ -211,146 +212,121 @@ def search_and_store_email_locations(session: Session,
                .with_column("SEARCHED_EMAIL", lit(email_address))
                .with_column("SEARCH_TIMESTAMP", current_timestamp())
     )
-
-    session.sql(
-        "DROP TABLE IF EXISTS PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS"
-    ).collect()
-    result_df.write.mode("overwrite").save_as_table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
-
+    # Append records to Snowflake table
+    result_df.write.mode("append").save_as_table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
     return hits
 
 # -----------------------------------------------------------------------------
-# SECTION 3: GRANT PRIVILEGES TO SYSADMIN
+# SECTION 3: GRANT PRIVILEGES TO SYSADMIN (restricted to Section 2 results)
 # -----------------------------------------------------------------------------
 
 def grant_privileges(session: snowpark.Session):
     """
     Grant USAGE and UPDATE privileges only on the databases, schemas, and tables
     where the submitted email was actually found (per EMAIL_SEARCH_RESULTS),
-    but restricted to the configured `search_databases`.
+    restricted to the configured `search_databases`.
     """
     print(" ")
     print("🔐 Granting scoped privileges based on EMAIL_SEARCH_RESULTS...")
     print("🔐 Restricting to databases:", search_databases)
 
-    # Load and filter results to only your search_databases
+    # Load and filter results: only submitted email AND search_databases
     results_df = (
-        session
-          .table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
-          .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
-          .distinct()
-          .filter(col("DATABASE_NAME").isin(search_databases))
+        session.table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
+        .filter(col("SEARCHED_EMAIL") == lit(email_submitted))
+        .filter(col("DATABASE_NAME").isin(search_databases))
+        .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
+        .distinct()
     )
 
-    # Bail early if nothing in your configured DBs
     if results_df.count() == 0:
-        print(f"ℹ️ No matching entries in {search_databases}; nothing to grant.")
+        print(f"ℹ️ No matching entries for {email_submitted} in {search_databases}; nothing to grant.")
         return
 
-    # Grant USAGE on each database in the filtered results
+    # Grant USAGE on each database
     dbs = [row["DATABASE_NAME"] for row in results_df.select("DATABASE_NAME").distinct().collect()]
     for db in dbs:
         try:
             session.sql(f"GRANT USAGE ON DATABASE {db} TO ROLE SYSADMIN").collect()
-            # print(f"🔑 Granted USAGE on database {db}")
         except Exception as e:
             print(f"⚠️ Failed to grant USAGE on database {db}: {e}")
 
-    # Grant USAGE on each schema in the filtered results
+    # Grant USAGE on each schema
     schemas = results_df.select("DATABASE_NAME", "TABLE_SCHEMA").distinct().collect()
     for row in schemas:
         schema_id = f"{row['DATABASE_NAME']}.{row['TABLE_SCHEMA']}"
         try:
             session.sql(f"GRANT USAGE ON SCHEMA {schema_id} TO ROLE SYSADMIN").collect()
-            # print(f"🔑 Granted USAGE on schema {schema_id}")
         except Exception as e:
             print(f"⚠️ Failed to grant USAGE on schema {schema_id}: {e}")
 
-    # Grant UPDATE on each table in the filtered results
-    tables = results_df.select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME").distinct().collect()
+    # Grant UPDATE on each table
+    tables = results_df.collect()
     for row in tables:
         table_id = f"{row['DATABASE_NAME']}.{row['TABLE_SCHEMA']}.{row['TABLE_NAME']}"
         try:
             session.sql(f"GRANT UPDATE ON TABLE {table_id} TO ROLE SYSADMIN").collect()
-            # print(f"🔑 Granted UPDATE on table {table_id}")
         except Exception as e:
             print(f"⚠️ Failed to grant UPDATE on table {table_id}: {e}")
 
 # -----------------------------------------------------------------------------
-# SECTION 4: CLASSIFY PII-RELATED COLUMNS 
+# SECTION 4: CLASSIFY PII-RELATED COLUMNS
 # -----------------------------------------------------------------------------
 
-def classify_columns(session: Session):
+def classify_columns(session: snowpark.Session):
     print(" ")
     print("🔎 Classifying columns and counting total columns per table:")
 
-    # Load all tables from EMAIL_SEARCH_RESULTS (any email)
-    all_tables_df = (
-        session
-          .table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
-          .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
-          .distinct()
-    )
-    total_tables = all_tables_df.count()
-
-    # Filter to only include current email_submitted
+    # Load filtered tables
     filtered_tables_df = (
-        all_tables_df
-          .join(
-             session.table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS"),
-             ["DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME"],
-             how="inner"
-          )
-          .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
-          .distinct()
+        session.table("PRD_MART.DATA_ANONYMIZATION.EMAIL_SEARCH_RESULTS")
+        .filter(col("SEARCHED_EMAIL") == lit(email_submitted))
+        .filter(col("DATABASE_NAME").isin(search_databases))
+        .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME")
+        .distinct()
     )
-    filtered_count = filtered_tables_df.count()
-    print(f"ℹ️ Tables matching '{email_submitted}': {filtered_count}")
 
-    # Use filtered_tables_df for downstream classification
-    tables_df = filtered_tables_df
-    tables = [(r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"])
-              for r in tables_df.collect()]
-    if not tables:
+    filtered_count = filtered_tables_df.count()
+    print(f"ℹ️ Tables matching '{email_submitted}' in {search_databases}: {filtered_count}")
+    if filtered_count == 0:
         print("ℹ️ No tables found for this email — skipping classification.")
         return
 
-    # Pull metadata for those tables
-    dbs = sorted({db for db, _, _ in tables})
+    # Collect restricted list of tables
+    tables = [(r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"]) 
+              for r in filtered_tables_df.collect()]
+
     meta_frames = []
-    for db in dbs:
-        tables_meta = (
-            session
-              .table(f"{db}.INFORMATION_SCHEMA.TABLES")
-              .filter(col("TABLE_TYPE") == "BASE TABLE")
-              .select("TABLE_SCHEMA", "TABLE_NAME")
-        )
-        cols = (
-            session
-              .table(f"{db}.INFORMATION_SCHEMA.COLUMNS")
-              .join(tables_meta, ["TABLE_SCHEMA", "TABLE_NAME"], how="inner")
-              .select(
-                  lit(db).alias("DATABASE_NAME"),
-                  col("TABLE_SCHEMA"),
-                  col("TABLE_NAME"),
-                  col("COLUMN_NAME"),
-                  col("DATA_TYPE"),
-                  col("CHARACTER_MAXIMUM_LENGTH")
-              )
-        )
-        meta_frames.append(cols)
-    meta = reduce(lambda a, b: a.union(b), meta_frames)
+    for db, schema, tbl in tables:
+        try:
+            # Fetch only the exact columns for the tables identified in Section 2
+            cols = (session.table(f"{db}.INFORMATION_SCHEMA.COLUMNS")
+                .filter((col("TABLE_SCHEMA") == lit(schema)) & (col("TABLE_NAME") == lit(tbl)))
+                .select(
+                    lit(db).alias("DATABASE_NAME"),
+                    col("TABLE_SCHEMA"),
+                    col("TABLE_NAME"),
+                    col("COLUMN_NAME"),
+                    col("DATA_TYPE"),
+                    col("CHARACTER_MAXIMUM_LENGTH")
+                )
+            )
 
-    # Restrict to just the tables you care about
-    meta = meta.join(tables_df, ["DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME"], how="inner")
+            meta_frames.append(cols)
+        except Exception as e:
+            print(f"⚠️ Could not fetch metadata for {db}.{schema}.{tbl}: {e}")
 
-    # Warn if any tables had no metadata
-    found   = set(meta.select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME").distinct().collect())
-    missing = set(tables) - found
-    if missing:
-        print(f"⚠️ No metadata found for these {len(missing)} tables: {missing}")
+    if not meta_frames:
+        print("⚠️ No metadata retrieved — aborting classification.")
+        return
 
-    # Build and apply a single PII mask using DSL-based filters:
+    # Union metadata for the filtered tables
+    meta = reduce(lambda a, b: a.union(b), meta_frames) if meta_frames else None
+    if meta is None:
+        print("⚠️ No metadata retrieved — aborting classification.")
+        return
+
+    # Apply PII classification masks
     regular_mask  = filter_cond & exclude_cond & ~remove_cond
     override_mask = override_cond
     pii_mask_final = regular_mask | override_mask
@@ -359,8 +335,7 @@ def classify_columns(session: Session):
     detailed_pre_df = meta.filter(pii_mask_final)
 
     # Build a map of PII columns per table for printing
-    from collections import defaultdict
-    pii_map = defaultdict(list)
+    pii_map = dd(list)
     for r in detailed_pre_df.select(
             "DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME"
         ).collect():
@@ -417,11 +392,12 @@ def classify_columns(session: Session):
             .otherwise(col("DATA_TYPE"))
             .alias("DATA_TYPE")
           )
+          .with_column("SUBMITTED_EMAIL", lit(email_submitted))
           .with_column("CLASSIFY_TIMESTAMP", current_timestamp())
     )
 
     # Write dataframe to Snowflake
-    detailed_df.write.mode("overwrite").save_as_table("PRD_MART.DATA_ANONYMIZATION.DETAILED_COLUMN_CLASSIFICATION_LOG")
+    detailed_df.write.mode("append").save_as_table("PRD_MART.DATA_ANONYMIZATION.DETAILED_COLUMN_CLASSIFICATION_LOG")
     print("📥 Written detailed PII-column log to DETAILED_COLUMN_CLASSIFICATION_LOG")
 
 # -----------------------------------------------------------------------------
@@ -440,6 +416,8 @@ def apply_nonemail_anonymization(session: Session):
     class_df = (
         session
         .table("PRD_MART.DATA_ANONYMIZATION.DETAILED_COLUMN_CLASSIFICATION_LOG")
+        .filter(col("SUBMITTED_EMAIL") == lit(email_submitted))
+        .filter(col("DATABASE_NAME").isin(search_databases))
         .select("DATABASE_NAME", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE")
     )
 
@@ -453,14 +431,13 @@ def apply_nonemail_anonymization(session: Session):
     )
 
     # Map each table to its email‐columns
-    from collections import defaultdict
-    email_cols_map: dict[tuple[str,str,str], list[str]] = defaultdict(list)
+    email_cols_map: dict[tuple[str,str,str], list[str]] = dd(list)
     for r in search_rows:
         key = (r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"])
         email_cols_map[key].append(r["COLUMN_NAME"])
 
     # Group columns by table for only for tables with submitted_email 
-    table_cols: dict[tuple[str,str,str], list[tuple[str,str]]] = defaultdict(list)
+    table_cols: dict[tuple[str,str,str], list[tuple[str,str]]] = dd(list)
     for row in class_df.collect():
         key = (row["DATABASE_NAME"], row["TABLE_SCHEMA"], row["TABLE_NAME"])
         dt = row["DATA_TYPE"].upper()
@@ -516,6 +493,8 @@ def apply_only_email_anonymization(session: Session):
     class_df = (
         session
         .table("PRD_MART.DATA_ANONYMIZATION.DETAILED_COLUMN_CLASSIFICATION_LOG")
+        .filter(col("SUBMITTED_EMAIL") == lit(email_submitted))
+        .filter(col("DATABASE_NAME").isin(search_databases))
         .select("DATABASE_NAME","TABLE_SCHEMA","TABLE_NAME","COLUMN_NAME","DATA_TYPE")
     )
 
@@ -529,7 +508,7 @@ def apply_only_email_anonymization(session: Session):
     )
 
     # Build a map of email-columns *that you also tagged as EMAIL*
-    email_cols_map = defaultdict(list)
+    email_cols_map = dd(list)
     for r in search_rows:
         key = (r["DATABASE_NAME"], r["TABLE_SCHEMA"], r["TABLE_NAME"])
         # confirm it’s in the detailed log as DATA_TYPE = 'EMAIL'
@@ -584,7 +563,7 @@ def apply_only_email_anonymization(session: Session):
             print(f"   • all rows cleared (0 remaining)")
 
     print("🔔 EMAIL anonymization pass complete.\n")
-
+    
 # -----------------------------------------------------------------------------
 # SECTION 7: MAIN FUNCTION ENTRY POINT
 # -----------------------------------------------------------------------------
@@ -594,13 +573,14 @@ def main():
     hits = search_and_store_email_locations(session, email_submitted, search_databases)
     if not hits:
         print(" ")
-        print("🔔 No tables contained the submitted email — nothing to anonymize.")
+        print("🔔 Submitted email not found in the list of databases — nothing to anonymize.")
         print(" ")
         return
     grant_privileges(session)
     classify_columns(session)
     apply_nonemail_anonymization(session)
     apply_only_email_anonymization(session)
+    print(" Anonymization process completed.")
     
 if __name__ == "__main__":
     main()
