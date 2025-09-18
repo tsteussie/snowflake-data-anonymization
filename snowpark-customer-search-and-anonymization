@@ -5,7 +5,7 @@ from snowflake.snowpark import Session
 from functools import reduce
 from collections import defaultdict as dd
 
-email_submitted = "schneiderjohnh@gmail.com"
+email_submitted = "test@gmail.com"
 
 # The following databases were not identified in historic data-anonymization requests: 'DEV_VAULT','PRD_VAULT','TST_VAULT','HANDLED','HUBSPOT_7508023'
 search_databases = ["DEV_COPY", "DEV_DBT", "DEV_INFODEPRC", "DEV_LAKE", "DEV_MART", "DEV_MART_STAGE", "DEV_WORK", \
